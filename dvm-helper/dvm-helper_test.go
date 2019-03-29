@@ -3,14 +3,13 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/fatih/color"
+	"github.com/howtowhale/dvm/dvm-helper/internal/test"
 	"github.com/ryanuber/go-glob"
 	"github.com/stretchr/testify/assert"
 )
@@ -48,8 +47,8 @@ func githubReleasesHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	switch r.RequestURI {
-	case "/repos/docker/docker/releases?per_page=100":
-		fmt.Fprintln(w, loadTestData("github-docker-releases.json"))
+	case "/repos/moby/moby/releases?per_page=100":
+		fmt.Fprintln(w, test.LoadTestData("github-docker-releases.json"))
 	default:
 		w.WriteHeader(404)
 	}
@@ -119,12 +118,16 @@ func TestListRemote(t *testing.T) {
 	color.Output = outputCapture
 
 	dvm := makeCliApp()
-	dvm.Run([]string{"dvm", "--debug", "list-remote", "1.12"})
+	dvm.Run([]string{"dvm", "--debug", "list-remote"})
 
 	output := outputCapture.String()
 	assert.NotEmpty(t, output, "Should have captured stdout")
-	assert.NotContains(t, output, "1.12.5-rc1", "Should not have listed a prerelease version")
 
+	assert.Contains(t, output, "1.12.5", "Should have listed a legacy stable version")
+	assert.NotContains(t, output, "1.12.5-rc1", "Should not have listed a legacy prerelease version")
+
+	assert.Contains(t, output, "17.09.0-ce", "Should have listed a stable version")
+	assert.NotContains(t, output, "17.10.0-ce-rc1", "Should not have listed a prerelease version")
 }
 
 func TestListRemoteWithPrereleases(t *testing.T) {
@@ -135,12 +138,13 @@ func TestListRemoteWithPrereleases(t *testing.T) {
 	color.Output = outputCapture
 
 	dvm := makeCliApp()
-	dvm.Run([]string{"dvm-helper", "--debug", "list-remote", "--pre", "1.12"})
+	dvm.Run([]string{"dvm-helper", "--debug", "list-remote", "--pre"})
 
 	output := outputCapture.String()
 	assert.NotEmpty(t, output, "Should have captured stdout")
-	assert.Contains(t, output, "1.12.5-rc1", "Should have listed a prerelease version")
 
+	assert.Contains(t, output, "1.12.5-rc1", "Should have listed a legacy prerelease version")
+	assert.Contains(t, output, "17.10.0-ce-rc1", "Should have listed a prerelease version")
 }
 
 func TestInstallPrereleases(t *testing.T) {
@@ -151,23 +155,41 @@ func TestInstallPrereleases(t *testing.T) {
 	color.Output = outputCapture
 
 	dvm := makeCliApp()
-	dvm.Run([]string{"dvm-helper", "--debug", "install", "1.12.5-rc1"})
+	dvm.Run([]string{"dvm-helper", "--debug", "install", "18.06.1-ce"})
 
 	output := outputCapture.String()
 	assert.NotEmpty(t, output, "Should have captured stdout")
-	assert.Contains(t, output, "Now using Docker 1.12.5-rc1", "Should have installed a prerelease version")
+	assert.Contains(t, output, "Now using Docker 18.06.1-ce", "Should have installed a prerelease version")
 }
 
-func loadTestData(src string) string {
-	pwd, err := os.Getwd()
-	if err != nil {
-		panic(err)
-	}
+// install a version from the test location that is missing the -rc suffix
+func TestInstallNonPrereleaseTestRelease(t *testing.T) {
+	_, github := createMockDVM(nil)
+	defer github.Close()
 
-	testFile := filepath.Join(pwd, "testdata", src)
-	content, err := ioutil.ReadFile(testFile)
-	if err != nil {
-		panic(err)
-	}
-	return string(content)
+	outputCapture := &bytes.Buffer{}
+	color.Output = outputCapture
+
+	dvm := makeCliApp()
+	dvm.Run([]string{"dvm-helper", "--debug", "install", "17.10.0-ce"})
+
+	output := outputCapture.String()
+	assert.NotEmpty(t, output, "Should have captured stdout")
+	assert.Contains(t, output, "Now using Docker 17.10.0-ce", "Should have installed a test version")
+}
+
+// install something that used to be a test release and is now considered stable
+func TestInstallStabilizedTestRelease(t *testing.T) {
+	_, github := createMockDVM(nil)
+	defer github.Close()
+
+	outputCapture := &bytes.Buffer{}
+	color.Output = outputCapture
+
+	dvm := makeCliApp()
+	dvm.Run([]string{"dvm-helper", "--debug", "install", "17.09.0-ce"})
+
+	output := outputCapture.String()
+	assert.NotEmpty(t, output, "Should have captured stdout")
+	assert.Contains(t, output, "Now using Docker 17.09.0-ce", "Should have installed a stable version")
 }

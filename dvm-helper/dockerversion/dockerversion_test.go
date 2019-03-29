@@ -2,9 +2,12 @@ package dockerversion
 
 import (
 	"fmt"
+	"io/ioutil"
 	"net/http"
+	"path/filepath"
 	"testing"
 
+	"github.com/howtowhale/dvm/dvm-helper/internal/config"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 )
@@ -53,16 +56,29 @@ func TestSystemAlias(t *testing.T) {
 		"The value for an empty aliased version should be empty")
 }
 
-func TestExperimentalAlias(t *testing.T) {
-	v := Parse(ExperimentalAlias)
-	assert.Equal(t, ExperimentalAlias, v.Slug(),
-		"The slug for the experimental version should be 'experimental'")
-	assert.Equal(t, ExperimentalAlias, v.String(),
+func TestEdgeAlias(t *testing.T) {
+	v := Parse(EdgeAlias)
+	assert.Equal(t, EdgeAlias, v.Slug(),
+		"The slug for the edge version should be 'edge'")
+	assert.Equal(t, EdgeAlias, v.String(),
 		"An empty alias should only print the alias")
-	assert.Equal(t, ExperimentalAlias, v.Name(),
+	assert.Equal(t, EdgeAlias, v.Name(),
 		"The name for an aliased version should be its alias")
 	assert.Equal(t, "", v.Value(),
 		"The value for an empty aliased version should be empty")
+}
+
+func TestEdgeAliasWithVersion(t *testing.T) {
+	v := Parse("17.06.0-ce+02c1d87")
+	v.SetAsEdge()
+	assert.Equal(t, EdgeAlias, v.Slug(),
+		"The slug for the edge version should be 'edge'")
+	assert.Equal(t, "edge (17.06.0-ce+02c1d87)", v.String(),
+		"The string representation should include the alias and version")
+	assert.Equal(t, EdgeAlias, v.Name(),
+		"The name for an aliased version should be its alias")
+	assert.Equal(t, "17.06.0-ce+02c1d87", v.Value(),
+		"The value for a populated alias should be the version")
 }
 
 func TestAlias(t *testing.T) {
@@ -89,10 +105,10 @@ func TestSemanticVersion(t *testing.T) {
 		"The value for a semantic version should be its semver value")
 }
 
-func TestSetAsExperimental(t *testing.T) {
+func TestSetAsEdge(t *testing.T) {
 	v := Parse("1.2.3")
-	v.SetAsExperimental()
-	assert.True(t, v.IsExperimental())
+	v.SetAsEdge()
+	assert.True(t, v.IsEdge())
 }
 
 func TestSetAsSystem(t *testing.T) {
@@ -105,40 +121,79 @@ func TestVersion_BuildDownloadURL(t *testing.T) {
 	testcases := map[Version]struct {
 		wantURL      string
 		wantArchived bool
+		wantChecksum bool
 	}{
 		// original download location, without compression
-		Parse("1.10.3"): {fmt.Sprintf("https://get.docker.com/builds/%s/%s/docker-1.10.3", dockerOS, dockerArch), false},
+		Parse("1.10.3"): {
+			wantURL:      fmt.Sprintf("https://get.docker.com/builds/%s/%s/docker-1.10.3", dockerOS, dockerArch),
+			wantArchived: false,
+			wantChecksum: true,
+		},
 
 		// original download location, without compression, prerelease
-		Parse("1.10.0-rc1"): {fmt.Sprintf("https://test.docker.com/builds/%s/%s/docker-1.10.0-rc1", dockerOS, dockerArch), false},
+		/* test.docker.com has been removed by docker
+		Parse("1.10.0-rc1"): {
+			wantURL:      fmt.Sprintf("https://test.docker.com/builds/%s/%s/docker-1.10.0-rc1", dockerOS, dockerArch),
+			wantArchived: false,
+			wantChecksum: true,
+		},
+		*/
 
 		// compressed binaries
-		Parse("1.11.0-rc1"): {fmt.Sprintf("https://test.docker.com/builds/%s/%s/docker-1.11.0-rc1.tgz", dockerOS, dockerArch), true},
+		/* test.docker.com has been removed by docker
+		Parse("1.11.0-rc1"): {
+			wantURL:      fmt.Sprintf("https://test.docker.com/builds/%s/%s/docker-1.11.0-rc1.tgz", dockerOS, dockerArch),
+			wantArchived: true,
+			wantChecksum: true,
+		},
+		*/
 
 		// original version scheme, prerelease binaries
-		Parse("1.13.0-rc1"): {fmt.Sprintf("https://test.docker.com/builds/%s/%s/docker-1.13.0-rc1.tgz", dockerOS, dockerArch), true},
+		/* test.docker.com has been removed by docker
+		Parse("1.13.0-rc1"): {
+			wantURL:      fmt.Sprintf("https://test.docker.com/builds/%s/%s/docker-1.13.0-rc1.tgz", dockerOS, dockerArch),
+			wantArchived: true,
+			wantChecksum: true,
+		},
+		*/
 
 		// yearly notation, original download location, release location
-		Parse("17.03.0-ce"): {fmt.Sprintf("https://get.docker.com/builds/%s/%s/docker-17.03.0-ce%s", dockerOS, dockerArch, archiveFileExt), true},
+		Parse("17.03.0-ce"): {
+			wantURL:      fmt.Sprintf("https://get.docker.com/builds/%s/%s/docker-17.03.0-ce%s", dockerOS, dockerArch, archiveFileExt),
+			wantArchived: true,
+			wantChecksum: true,
+		},
 
-		// docker store download
-		Parse("17.06.0-ce"): {fmt.Sprintf("https://download.docker.com/%s/static/stable/%s/docker-17.06.0-ce.tgz", mobyOS, dockerArch), true},
+		// docker store download (no more checksums)
+		Parse("17.06.0-ce"): {
+			wantURL:      fmt.Sprintf("https://download.docker.com/%s/static/stable/%s/docker-17.06.0-ce.tgz", mobyOS, dockerArch),
+			wantArchived: true,
+			wantChecksum: false,
+		},
 
 		// docker store download, prerelease
-		Parse("17.07.0-ce-rc1"): {fmt.Sprintf("https://download.docker.com/%s/static/test/%s/docker-17.07.0-ce-rc1.tgz", mobyOS, dockerArch), true},
-
-		// latest edge/experimental
-		Parse("experimental"): {fmt.Sprintf("https://download.docker.com/%s/static/edge/%s/docker-17.06.0-ce.tgz", mobyOS, dockerArch), true},
+		Parse("17.07.0-ce-rc1"): {
+			wantURL:      fmt.Sprintf("https://download.docker.com/%s/static/test/%s/docker-17.07.0-ce-rc1.tgz", mobyOS, dockerArch),
+			wantArchived: true,
+			wantChecksum: false,
+		},
 	}
 
 	for version, testcase := range testcases {
 		t.Run(version.String(), func(t *testing.T) {
-			gotURL, gotArchived := version.BuildDownloadURL("")
+			gotURL, gotArchived, gotChecksumed, err := version.buildDownloadURL("", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+
 			if testcase.wantURL != gotURL {
 				t.Fatalf("Expected %s to be downloaded from '%s', but got '%s'", version, testcase.wantURL, gotURL)
 			}
 			if testcase.wantArchived != gotArchived {
-				t.Fatalf("Expected %s to use an archived download strategy", version)
+				t.Fatalf("Expected archive for %s to be %v, got %v", version, testcase.wantArchived, gotArchived)
+			}
+			if testcase.wantChecksum != gotChecksumed {
+				t.Fatalf("Expected checksum for %s to be %v, got %v", version, testcase.wantChecksum, gotChecksumed)
 			}
 
 			response, err := http.DefaultClient.Head(gotURL)
@@ -150,5 +205,18 @@ func TestVersion_BuildDownloadURL(t *testing.T) {
 				t.Fatalf("Unexpected status code (%d) when downloading %s", response.StatusCode, gotURL)
 			}
 		})
+	}
+}
+
+func TestVersion_DownloadEdgeRelease(t *testing.T) {
+	version := Parse("edge")
+	tempDir, _ := ioutil.TempDir("", "dvmtest")
+	opts := config.NewDvmOptions()
+	opts.DvmDir = filepath.Join(tempDir, ".dvm")
+	destPath := filepath.Join(opts.DvmDir, "docker")
+
+	err := version.Download(opts, destPath)
+	if err != nil {
+		t.Fatalf("%#v", err)
 	}
 }

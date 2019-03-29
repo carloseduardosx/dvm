@@ -2,13 +2,12 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io/ioutil"
+	"log"
 	neturl "net/url"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -19,27 +18,24 @@ import (
 	"github.com/fatih/color"
 	"github.com/google/go-github/github"
 	"github.com/howtowhale/dvm/dvm-helper/dockerversion"
+	"github.com/howtowhale/dvm/dvm-helper/internal/config"
 	"github.com/howtowhale/dvm/dvm-helper/url"
+	"github.com/pkg/errors"
 	"github.com/ryanuber/go-glob"
 	"golang.org/x/oauth2"
 )
 
 // These are global command line variables
-var shell string
-var dvmDir string
-var mirrorURL string
-var githubUrlOverride string
-var debug bool
-var silent bool
-var nocheck bool
+var opts = config.NewDvmOptions()
+
+// This is a nasty global state flag that we flip. Bad Carolyn.
 var useAfterInstall bool
-var token string
-var includePrereleases bool
 
 // These are set during the build
 var dvmVersion string
 var dvmCommit string
 var upgradeDisabled string // Allow package managers like homebrew to disable in-place upgrades
+var githubUrlOverride string
 
 const (
 	retCodeInvalidArgument  = 127
@@ -81,10 +77,9 @@ func makeCliApp() *cli.App {
 		{
 			Name:    "install",
 			Aliases: []string{"i"},
-			Usage:   "dvm install [<version>], dvm install experimental\n\tInstall a Docker version, using $DOCKER_VERSION if the version is not specified.",
+			Usage:   "dvm install [<version>], dvm install edge\n\tInstall a Docker version, using $DOCKER_VERSION if the version is not specified.",
 			Flags: []cli.Flag{
 				cli.StringFlag{Name: "mirror-url", EnvVar: "DVM_MIRROR_URL", Usage: "Specify an alternate URL from which to download the Docker client. Defaults to https://get.docker.com/builds"},
-				cli.BoolFlag{Name: "nocheck", EnvVar: "DVM_NOCHECK", Usage: "Do not check if version exists (use with caution)."},
 			},
 			Action: func(c *cli.Context) error {
 				setGlobalVars(c)
@@ -121,7 +116,7 @@ func makeCliApp() *cli.App {
 		},
 		{
 			Name:  "use",
-			Usage: "dvm use [<version>], dvm use system, dvm use experimental\n\tUse a Docker version, using $DOCKER_VERSION if the version is not specified.",
+			Usage: "dvm use [<version>], dvm use system, dvm use edge\n\tUse a Docker version, using $DOCKER_VERSION if the version is not specified.",
 			Flags: []cli.Flag{
 				cli.StringFlag{Name: "mirror-url", EnvVar: "DVM_MIRROR_URL", Usage: "Specify an alternate URL from which to download the Docker client. Defaults to https://get.docker.com/builds"},
 				cli.BoolFlag{Name: "nocheck", EnvVar: "DVM_NOCHECK", Usage: "Do not check if version exists (use with caution)."},
@@ -276,21 +271,26 @@ func makeCliApp() *cli.App {
 func setGlobalVars(c *cli.Context) {
 	useAfterInstall = true
 
-	debug = c.GlobalBool("debug")
-	nocheck = c.Bool("nocheck")
-	token = c.GlobalString("github-token")
-	shell = c.GlobalString("shell")
+	opts.Debug = c.GlobalBool("debug")
+	if opts.Debug {
+		opts.Logger = log.New(color.Output, "", log.LstdFlags)
+	} else {
+		opts.Logger = log.New(ioutil.Discard, "", log.LstdFlags)
+	}
+
+	opts.Token = c.GlobalString("github-token")
+	opts.Shell = c.GlobalString("shell")
 	validateShellFlag()
 
-	silent = c.GlobalBool("silent")
-	mirrorURL = c.String("mirror-url")
-	includePrereleases = c.Bool("pre")
+	opts.Silent = c.GlobalBool("silent")
+	opts.MirrorURL = c.String("mirror-url")
+	opts.IncludePrereleases = c.Bool("pre")
 
-	dvmDir = c.GlobalString("dvm-dir")
-	if dvmDir == "" {
-		dvmDir = filepath.Join(getUserHomeDir(), ".dvm")
+	opts.DvmDir = c.GlobalString("dvm-dir")
+	if opts.DvmDir == "" {
+		opts.DvmDir = filepath.Join(getUserHomeDir(), ".dvm")
 	}
-	writeDebug("The dvm home directory is: %s", dvmDir)
+	writeDebug("The dvm home directory is: %s", opts.DvmDir)
 }
 
 func detect() {
@@ -329,7 +329,7 @@ func detect() {
 		}
 
 		// Find the highest version that satisfies the client version range
-		availableVersions := getAvailableVersions("")
+		availableVersions := getAvailableVersions("", true)
 		for i := len(availableVersions) - 1; i >= 0; i-- {
 			v := availableVersions[i]
 
@@ -347,7 +347,6 @@ func detect() {
 	os.Setenv(versionEnvVar, version.String())
 	writeEnvironmentVariableScript(versionEnvVar)
 
-	nocheck = true
 	use(version)
 }
 
@@ -397,7 +396,7 @@ func list(pattern string) {
 	current, _ := getCurrentDockerVersion()
 
 	for _, version := range versions {
-		if current.Equals(version) {
+		if current.String() == version.String() {
 			color.Green("->\t%s", version)
 		} else {
 			writeInfo("\t%s", version)
@@ -406,27 +405,18 @@ func list(pattern string) {
 }
 
 func install(version dockerversion.Version) {
-	if nocheck {
-		writeDebug("Skipping version validation!")
-	}
-
-	if !nocheck && !versionExists(version) {
-		die("Version %s not found - try `dvm ls-remote` to browse available versions.", nil, retCodeInvalidOperation, version)
-	}
-
 	versionDir := getVersionDir(version)
 
-	if version.IsExperimental() && pathExists(versionDir) {
-		// Always install latest of experimental build
+	if version.IsEdge() {
+		// Always install latest of edge build
 		err := os.RemoveAll(versionDir)
 		if err != nil {
-			die("Unable to remove experimental version at %s.", err, retCodeRuntimeError, versionDir)
+			die("Unable to remove edge version at %s.", err, retCodeRuntimeError, versionDir)
 		}
 	}
 
 	if _, err := os.Stat(versionDir); err == nil {
 		writeWarning("%s is already installed", version)
-		nocheck = true
 		use(version)
 		return
 	}
@@ -436,22 +426,18 @@ func install(version dockerversion.Version) {
 	downloadRelease(version)
 
 	if useAfterInstall {
-		nocheck = true
 		use(version)
 	}
 }
 
 func downloadRelease(version dockerversion.Version) {
-	url, archived := version.BuildDownloadURL(mirrorURL)
-	binaryName := getBinaryName()
-	binaryPath := filepath.Join(getVersionDir(version), binaryName)
-	if archived {
-		archivedFile := path.Join("docker", binaryName)
-		downloadArchivedFileWithChecksum(url, archivedFile, binaryPath)
-	} else {
-		downloadFileWithChecksum(url, binaryPath)
+	destPath := filepath.Join(getVersionDir(version), getBinaryName())
+	err := version.Download(opts, destPath)
+	if err != nil {
+		die("", err, retCodeRuntimeError)
 	}
-	writeDebug("Downloaded Docker %s to %s.", version, binaryPath)
+
+	writeDebug("Downloaded Docker %s to %s", version, destPath)
 }
 
 func uninstall(version dockerversion.Version) {
@@ -486,8 +472,8 @@ func use(version dockerversion.Version) {
 
 	if version.IsSystem() {
 		version, _ = getSystemDockerVersion()
-	} else if version.IsExperimental() {
-		version, _ = getExperimentalDockerVersion()
+	} else if version.IsEdge() {
+		version, _ = getEdgeDockerVersion()
 	}
 
 	removePreviousDockerVersionFromPath()
@@ -571,7 +557,7 @@ func getAliases() map[string]string {
 }
 
 func getAliasPath(alias string) string {
-	return filepath.Join(dvmDir, "alias", alias)
+	return filepath.Join(opts.DvmDir, "alias", alias)
 }
 
 func getBinaryName() string {
@@ -597,14 +583,14 @@ func writeEnvironmentVariableScript(name string) {
 
 func buildDvmOutputScriptPath() string {
 	var fileExtension string
-	if shell == "powershell" {
+	if opts.Shell == "powershell" {
 		fileExtension = "ps1"
-	} else if shell == "cmd" {
+	} else if opts.Shell == "cmd" {
 		fileExtension = "cmd"
 	} else { // default to bash
 		fileExtension = "sh"
 	}
-	return filepath.Join(dvmDir, ".tmp", ("dvm-output." + fileExtension))
+	return filepath.Join(opts.DvmDir, ".tmp", "dvm-output."+fileExtension)
 }
 
 func removePreviousDockerVersionFromPath() {
@@ -634,21 +620,6 @@ func isVersionInstalled(version dockerversion.Version) bool {
 	return false
 }
 
-func versionExists(version dockerversion.Version) bool {
-	if version.IsExperimental() {
-		return true
-	}
-
-	availableVersions := getAvailableVersions(version.Value())
-
-	for _, availableVersion := range availableVersions {
-		if version.Equals(availableVersion) {
-			return true
-		}
-	}
-	return false
-}
-
 func getCurrentDockerPath() (string, error) {
 	currentDockerPath, err := exec.LookPath("docker")
 	return currentDockerPath, err
@@ -661,21 +632,21 @@ func getCurrentDockerVersion() (dockerversion.Version, error) {
 	}
 
 	systemDockerPath, _ := getSystemDockerPath()
-	experimentalVersionPath, _ := getExperimentalDockerPath()
+	edgeVersionPath, _ := getEdgeDockerPath()
 
 	isSystem := currentDockerPath == systemDockerPath
-	isExperimental := currentDockerPath == experimentalVersionPath
+	isEdge := currentDockerPath == edgeVersionPath
 
-	current, _ := getDockerVersion(currentDockerPath, isExperimental)
+	current, _ := getDockerVersion(currentDockerPath, isEdge)
 
 	if isSystem {
 		writeDebug("The current docker is the system installation")
 		current.SetAsSystem()
 	}
 
-	if isExperimental {
-		writeDebug("The current docker is an experimental version")
-		current.SetAsExperimental()
+	if isEdge {
+		writeDebug("The current docker is an edge version")
+		current.SetAsEdge()
 	}
 
 	writeDebug("The current version is: %s", current)
@@ -700,29 +671,30 @@ func getSystemDockerVersion() (dockerversion.Version, error) {
 	return version, err
 }
 
-func getExperimentalDockerPath() (string, error) {
-	experimentalVersionPath := filepath.Join(getVersionsDir(), dockerversion.ExperimentalAlias, getBinaryName())
-	_, err := os.Stat(experimentalVersionPath)
-	return experimentalVersionPath, err
+func getEdgeDockerPath() (string, error) {
+	edgeVersionPath := filepath.Join(getVersionsDir(), dockerversion.EdgeAlias, getBinaryName())
+	_, err := os.Stat(edgeVersionPath)
+	return edgeVersionPath, err
 }
 
-func getExperimentalDockerVersion() (dockerversion.Version, error) {
-	experimentalDockerpath, err := getExperimentalDockerPath()
+func getEdgeDockerVersion() (dockerversion.Version, error) {
+	edgeDockerpath, err := getEdgeDockerPath()
 	if err != nil {
 		return dockerversion.Version{}, err
 	}
-	version, err := getDockerVersion(experimentalDockerpath, true)
-	version.SetAsExperimental()
+	version, err := getDockerVersion(edgeDockerpath, true)
+	version.SetAsEdge()
 	return version, err
 }
 
 func getDockerVersion(dockerPath string, includeBuild bool) (dockerversion.Version, error) {
-	rawVersion, _ := exec.Command(dockerPath, "-v").Output()
+	stdout, _ := exec.Command(dockerPath, "-v").Output()
+	rawVersion := strings.TrimSpace(string(stdout))
 
 	writeDebug("%s -v output: %s", dockerPath, rawVersion)
 
-	versionRegex := regexp.MustCompile(`^Docker version (.+), build ([^,]+),?`)
-	match := versionRegex.FindSubmatch(rawVersion)
+	versionRegex := regexp.MustCompile(`^Docker version (.+), build (.+)?`)
+	match := versionRegex.FindStringSubmatch(rawVersion)
 	if len(match) < 2 {
 		return dockerversion.Version{}, errors.New("Could not detect docker version.")
 	}
@@ -736,11 +708,8 @@ func getDockerVersion(dockerPath string, includeBuild bool) (dockerversion.Versi
 }
 
 func listRemote(prefix string) {
-	versions := getAvailableVersions(prefix)
+	versions := getAvailableVersions(prefix, opts.IncludePrereleases)
 	for _, version := range versions {
-		if !includePrereleases && version.IsPrerelease() {
-			continue
-		}
 		writeInfo(version.String())
 	}
 }
@@ -753,14 +722,14 @@ func getInstalledVersions(pattern string) []dockerversion.Version {
 	for _, versionDir := range versions {
 		version := dockerversion.Parse(filepath.Base(versionDir))
 
-		if version.IsExperimental() {
-			experimentalDockerPath := filepath.Join(versionDir, getBinaryName())
-			experimentalVersion, err := getDockerVersion(experimentalDockerPath, true)
+		if version.IsEdge() {
+			edgeDockerPath := filepath.Join(versionDir, getBinaryName())
+			edgeVersion, err := getDockerVersion(edgeDockerPath, true)
 			if err != nil {
-				writeDebug("Unable to get version of installed experimental version at %s.\n%s", versionDir, err)
+				writeDebug("Unable to get version of installed edge version at %s.\n%s", versionDir, err)
 				continue
 			}
-			version = dockerversion.NewAlias(dockerversion.ExperimentalAlias, experimentalVersion.Value())
+			version = dockerversion.NewAlias(dockerversion.EdgeAlias, edgeVersion.Value())
 		}
 
 		results = append(results, version)
@@ -777,21 +746,71 @@ func getInstalledVersions(pattern string) []dockerversion.Version {
 	return results
 }
 
-func getAvailableVersions(pattern string) []dockerversion.Version {
+func getAvailableVersions(pattern string, includePrereleases bool) []dockerversion.Version {
+	versions := make(map[string]dockerversion.Version)
+
+	writeDebug("Retrieving legacy Docker releases")
+	legacyVersions, err := listLegacyDockerVersions()
+	if err != nil {
+		die("", err, retCodeRuntimeError)
+	}
+	for _, v := range legacyVersions {
+		if !includePrereleases && v.IsPrerelease() {
+			continue
+		}
+		if strings.HasPrefix(v.Value(), pattern) {
+			versions[v.String()] = v
+		}
+	}
+
 	writeDebug("Retrieving Docker releases")
+	stableVersions, err := dockerversion.ListVersions(opts.MirrorURL, dockerversion.Stable)
+	if err != nil {
+		die("", err, retCodeRuntimeError)
+	}
+	for _, v := range stableVersions {
+		if strings.HasPrefix(v.Value(), pattern) {
+			versions[v.String()] = v
+		}
+	}
+
+	if includePrereleases {
+		writeDebug("Retrieving Docker pre-releases")
+		prereleaseVersions, err := dockerversion.ListVersions(opts.MirrorURL, dockerversion.Test)
+		if err != nil {
+			die("", err, retCodeRuntimeError)
+		}
+		for _, v := range prereleaseVersions {
+			if strings.HasPrefix(v.Value(), pattern) {
+				versions[v.String()] = v
+			}
+		}
+	}
+
+	results := make([]dockerversion.Version, 0, len(versions))
+	for _, v := range versions {
+		results = append(results, v)
+	}
+
+	dockerversion.Sort(results)
+
+	return results
+}
+
+func listLegacyDockerVersions() ([]dockerversion.Version, error) {
 	gh := buildGithubClient()
 	options := &github.ListOptions{PerPage: 100}
 
 	var allReleases []github.RepositoryRelease
 	for {
-		releases, response, err := gh.Repositories.ListReleases("docker", "docker", options)
+		releases, response, err := gh.Repositories.ListReleases("moby", "moby", options)
 		if err != nil {
 			warnWhenRateLimitExceeded(err, response)
-			die("Unable to retrieve list of Docker releases from GitHub", err, retCodeRuntimeError)
+			return nil, errors.Wrap(err, "Unable to retrieve list of Docker releases from GitHub")
 		}
 		allReleases = append(allReleases, releases...)
 		if response.StatusCode != 200 {
-			die("Unable to retrieve list of Docker releases from GitHub (Status %s).", nil, retCodeRuntimeError, response.StatusCode)
+			return nil, errors.Errorf("Unable to retrieve list of Docker releases from GitHub (Status %v).", response.StatusCode)
 		}
 		if response.NextPage == 0 {
 			break
@@ -807,14 +826,10 @@ func getAvailableVersions(pattern string) []dockerversion.Version {
 			writeDebug("Ignoring non-semver Docker release: %s", version)
 			continue
 		}
-
-		if strings.HasPrefix(v.Value(), pattern) {
-			results = append(results, v)
-		}
+		results = append(results, v)
 	}
 
-	dockerversion.Sort(results)
-	return results
+	return results, nil
 }
 
 func isUpgradeAvailable() (bool, string) {
@@ -848,13 +863,13 @@ func isUpgradeAvailable() (bool, string) {
 }
 
 func getVersionsDir() string {
-	return filepath.Join(dvmDir, "bin", "docker")
+	return filepath.Join(opts.DvmDir, "bin", "docker")
 }
 
 func getVersionDir(version dockerversion.Version) string {
 	versionPath := version.Slug()
-	if version.IsExperimental() {
-		versionPath = dockerversion.ExperimentalAlias
+	if version.IsEdge() {
+		versionPath = dockerversion.EdgeAlias
 	}
 	return filepath.Join(getVersionsDir(), versionPath)
 }
@@ -864,8 +879,8 @@ func getDockerVersionVar() string {
 }
 
 func buildGithubClient() *github.Client {
-	if token != "" {
-		tokenSource := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
+	if opts.Token != "" {
+		tokenSource := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: opts.Token})
 		httpClient := oauth2.NewClient(oauth2.NoContext, tokenSource)
 		return github.NewClient(httpClient)
 	}
